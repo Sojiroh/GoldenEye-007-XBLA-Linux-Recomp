@@ -295,6 +295,8 @@ std::string KeyText(const char* cvar) {
     if (one == "LMB") one = "Left Click";
     else if (one == "RMB") one = "Right Click";
     else if (one == "MMB") one = "Middle Click";
+    else if (one == "Mouse4") one = "Mouse 4";
+    else if (one == "Mouse5") one = "Mouse 5";
     else if (one == "Control") one = "Ctrl";
     else if (one == "WheelUp") one = "Wheel Up";
     else if (one == "WheelDown") one = "Wheel Down";
@@ -446,7 +448,6 @@ std::vector<Row> BuildPage(Page page) {
               text += " - restarts";
             return text;
           });
-      AddChoice(rows, "Upscaling:", "ge_upscaling", {{"FSR", "on"}, {"Off", "off"}});
       AddAction(rows, "Post-Processing", [] { g_page = Page::PostFx; });
       AddAction(rows, "Done", [] {
         RestartIfRenderScaleChanged();
@@ -456,6 +457,8 @@ std::vector<Row> BuildPage(Page page) {
     }
     case Page::PostFx:
       rows.push_back(Row{RowKind::Toggle, "Post-Processing:", "postfx_enabled"});
+      // Upscaling lives here: the Video page holds ten rows.
+      AddChoice(rows, "Upscaling:", "ge_upscaling", {{"FSR", "on"}, {"Off", "off"}});
       AddSlider(rows, "Brightness:", "postfx_brightness", -1.0f, 1.0f, 0.02f);
       AddSlider(rows, "Contrast:", "postfx_contrast", 0.0f, 2.0f, 0.02f);
       AddSlider(rows, "Saturation:", "postfx_saturation", 0.0f, 2.0f, 0.02f);
