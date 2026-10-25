@@ -170,4 +170,35 @@ int WindowDisplayHeight(HWND window) {
   return ModeHeight(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY));
 }
 
+bool NvidiaGpuClocks(unsigned& memory_mhz, unsigned& graphics_mhz, int& pstate) {
+  using NvmlInit = int(__cdecl*)();
+  using NvmlHandleByIndex = int(__cdecl*)(unsigned, void**);
+  using NvmlClockInfo = int(__cdecl*)(void*, int, unsigned*);
+  using NvmlPState = int(__cdecl*)(void*, int*);
+  static bool tried = false;
+  static void* device = nullptr;
+  static NvmlClockInfo clock_info = nullptr;
+  static NvmlPState performance_state = nullptr;
+  if (!tried) {
+    tried = true;
+    HMODULE nvml = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!nvml) return false;
+    auto init = reinterpret_cast<NvmlInit>(GetProcAddress(nvml, "nvmlInit_v2"));
+    auto by_index =
+        reinterpret_cast<NvmlHandleByIndex>(GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex_v2"));
+    clock_info = reinterpret_cast<NvmlClockInfo>(GetProcAddress(nvml, "nvmlDeviceGetClockInfo"));
+    performance_state =
+        reinterpret_cast<NvmlPState>(GetProcAddress(nvml, "nvmlDeviceGetPerformanceState"));
+    if (!init || !by_index || !clock_info || !performance_state || init() != 0 ||
+        by_index(0, &device) != 0) {
+      device = nullptr;
+    }
+  }
+  if (!device) return false;
+  constexpr int kClockGraphics = 0, kClockMemory = 2;  // nvmlClockType_t
+  return clock_info(device, kClockMemory, &memory_mhz) == 0 &&
+         clock_info(device, kClockGraphics, &graphics_mhz) == 0 &&
+         performance_state(device, &pstate) == 0;
+}
+
 }  // namespace ge

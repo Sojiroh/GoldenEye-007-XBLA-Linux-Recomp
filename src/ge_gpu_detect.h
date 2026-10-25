@@ -27,5 +27,9 @@ int WindowDisplayHeight(HWND__* window);
 double DisplayRefreshHz(HWND__* window);
 // "2560x1440 @ 165 Hz" for the display the game opens on (log header).
 std::string StartupDisplayMode(int monitor_option);
+// NVIDIA only (NVML from the driver, loaded on first use): the first GPU's
+// current memory and graphics clocks and performance state (0 = P0, fastest).
+// False on other GPUs or when NVML is unavailable.
+bool NvidiaGpuClocks(unsigned& memory_mhz, unsigned& graphics_mhz, int& pstate);
 
 }  // namespace ge

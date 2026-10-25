@@ -279,6 +279,37 @@ std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest p
 // (144 Hz, G-Sync / FreeSync screens reporting their maximum) keep 60.
 REXCVAR_DEFINE_BOOL(ge_match_display_refresh, true, "Video",
                     "Run the game clock at a ~60 Hz display's exact refresh rate (off: always 60 Hz)");
+// performance_diagnostics (vblank_timing_log): log NVIDIA memory clock and
+// performance-state changes, sampled every 250 ms. A driver that keeps
+// switching the memory clock because the game loads the GPU lightly stalls the
+// GPU briefly at each switch, which shows as a regular judder.
+void ge_log_gpu_clock_changes() {
+  static uint32_t poll = 0;
+  static bool on = false;
+  if ((poll++ % 8) == 0) on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+  if (!on) return;
+  unsigned memory_mhz = 0, graphics_mhz = 0;
+  int pstate = -1;
+  if (!ge::NvidiaGpuClocks(memory_mhz, graphics_mhz, pstate)) return;
+  static unsigned last_memory = 0;
+  static int last_pstate = -1;
+  static uint32_t changes = 0, window_start = 0, suppressed = 0;
+  if (memory_mhz == last_memory && pstate == last_pstate) return;
+  if (poll - window_start >= 240) {  // at most 40 lines a minute
+    if (suppressed) REXKRNL_INFO("ge gpu clock: {} more changes not logged", suppressed);
+    window_start = poll;
+    changes = suppressed = 0;
+  }
+  if (++changes <= 40) {
+    REXKRNL_INFO("ge gpu clock: memory {} MHz, graphics {} MHz, P{}", memory_mhz, graphics_mhz,
+                 pstate);
+  } else {
+    ++suppressed;
+  }
+  last_memory = memory_mhz;
+  last_pstate = pstate;
+}
+
 void ge_match_display_refresh() {
   static double logged_hz = -1.0, applied = -1.0;
   HWND hwnd = g_game_hwnd_for_resize();
@@ -323,6 +354,7 @@ void ge_watchdog_thread() {
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     if ((display_check++ % 8) == 0) ge_match_display_refresh();  // every 2 s
+    ge_log_gpu_clock_changes();
     auto* cp = ge_cp();
     if (!cp) continue;
     uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
@@ -874,6 +906,23 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
     static int64_t log_start = 0;
     if ((poll++ & 0x3F) == 0)
       log_on = rex::cvar::GetFlagByName("vblank_timing_log") == "true";
+    // Frames where the game's frame counter (0x8308851C) moved by more than one
+    // step without a slow frame: the game's own clock ran ahead of the vblank
+    // and the picture jumped. Counted for the 10-second line.
+    static uint32_t last_counter = 0, double_steps = 0;
+    {
+      const uint32_t counter = LD32(base, 0x8308851Cu);
+      const uint32_t n = g_guest_presents.load(std::memory_order_relaxed);
+      if (log_on && last_counter && counter - last_counter >= 2 && counter - last_counter < 4 &&
+          n >= 2) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        const int64_t prev = g_present_qpc[(n - 2) % kPresentRing].load(std::memory_order_relaxed);
+        const double ms = double(qpc.QuadPart - prev) * 1000.0 / double(f.QuadPart);
+        if (prev && ms < 20.0) ++double_steps;
+      }
+      last_counter = counter;
+    }
     // Each slow frame (over 25 ms, i.e. a missed 60 Hz tick) on its own line,
     // with what the game thread waited on; file reads and new pipelines are
     // logged by the SDK at the same time stamps.
@@ -911,9 +960,11 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
           for (double v : ms)
             if (v > mean * 1.5) ++hitches;
           REXKRNL_INFO("ge frames: {} frames, {:.2f} fps, frame time mean {:.3f} ms sd {:.3f} "
-                       "min {:.3f} max {:.3f}, {} hitches (>1.5x mean)",
+                       "min {:.3f} max {:.3f}, {} hitches (>1.5x mean), {} double steps",
                        ms.size(), 1000.0 / mean, mean,
-                       std::sqrt(std::max(0.0, sq / ms.size() - mean * mean)), mn, mx, hitches);
+                       std::sqrt(std::max(0.0, sq / ms.size() - mean * mean)), mn, mx, hitches,
+                       double_steps);
+          double_steps = 0;
         }
         log_start = qpc.QuadPart;
       }

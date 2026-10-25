@@ -141,6 +141,10 @@ class GeApp : public rex::ReXApp {
   // OnCreateDialogs hands it to the GPU plugin before the emulated GPU starts.
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
+    // The game counts its simulation steps in timebase ticks at the Xbox 360's
+    // 49.875 MHz. At the SDK's 50 MHz it stepped 0.25% faster than the 60 Hz
+    // vblank, so every ~6.8 s one frame advanced two steps: a visible jump.
+    rex::cvar::SetFlagByName("guest_timebase_hz", "49875000");
     ge::ApplyRenderScale();
     ge::ApplyUpscaling();  // present_effect, read when the presenter starts
   }

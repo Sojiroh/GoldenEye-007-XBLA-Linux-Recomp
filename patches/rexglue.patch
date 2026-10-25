@@ -112,6 +112,23 @@ index 41e6dce..8dfbb98 100644
      target_compile_definitions(${target_name} PRIVATE
          REXGLUE_BUILD_CONFIG="$<CONFIG>")
  
+diff --git a/include/rex/chrono/clock.h b/include/rex/chrono/clock.h
+index c19caea..4e3f876 100644
+--- a/include/rex/chrono/clock.h
++++ b/include/rex/chrono/clock.h
+@@ -62,6 +62,12 @@ class Clock {
+   static uint64_t guest_tick_frequency();
+   // Sets the guest ticks-per-second.
+   static void set_guest_tick_frequency(uint64_t frequency);
++  // ge: rate of guest time against real time (1 = real time), changed without
++  // a jump: guest ticks continue from their current value at the new rate.
++  // Used to run the whole guest clock (timebase and vblank together) at a
++  // ~60 Hz display's exact rate, e.g. 0.999 for 59.94 Hz.
++  static double guest_rate();
++  static void set_guest_rate(double rate);
+   // Time based used for the guest system time.
+   static uint64_t guest_system_time_base();
+   // Sets the guest time base, used for computing the system time.
 diff --git a/include/rex/gpu_stall_recovery.h b/include/rex/gpu_stall_recovery.h
 new file mode 100644
 index 0000000..33d3dcc
@@ -1004,7 +1021,7 @@ index 40ae269..016c47d 100644
        {PPC_INST_BLR, build_blr},
        {PPC_INST_BLRL, build_blrl},
 diff --git a/src/core/clock.cpp b/src/core/clock.cpp
-index ae72b7a..237315f 100644
+index ae72b7a..d663a6c 100644
 --- a/src/core/clock.cpp
 +++ b/src/core/clock.cpp
 @@ -10,6 +10,7 @@
@@ -1029,7 +1046,7 @@ index ae72b7a..237315f 100644
                      "Disable clock scaling (inverted: false = scaling enabled)");
  
  REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
-@@ -36,7 +42,8 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
+@@ -36,12 +42,24 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
  std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
  
  // Native guest ticks.
@@ -1039,8 +1056,30 @@ index ae72b7a..237315f 100644
  // Last sampled host tick count.
  uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
  // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
-@@ -61,31 +68,25 @@ void RecomputeGuestTickScalar() {
+ std::mutex tick_mutex_;
+ 
++// ge: guest clock segment after a set_guest_rate change: guest ticks are
++// guest_base + (host - host_base) * ratio. Published atomically and never
++// freed (a handful of rate changes per session), so readers stay lock-free.
++struct GuestClockSegment {
++  uint64_t host_base;
++  uint64_t guest_base;
++  double ratio;
++};
++std::atomic<const GuestClockSegment*> guest_segment_{nullptr};
++double guest_rate_ = 1.0;
++
+ void RecomputeGuestTickScalar() {
+   // Create a rational number with numerator (first) and denominator (second)
+   auto frac = std::make_pair(guest_tick_frequency_, Clock::QueryHostTickFrequency());
+@@ -59,33 +77,36 @@ void RecomputeGuestTickScalar() {
+ 
+   std::lock_guard<std::mutex> lock(tick_mutex_);
    guest_tick_ratio_ = frac;
++  // A frequency change (startup only) restarts the plain ratio; set_guest_rate
++  // builds on it again.
++  guest_segment_.store(nullptr, std::memory_order_release);
++  guest_rate_ = 1.0;
  }
  
 -// Update the guest timer for all threads.
@@ -1078,7 +1117,11 @@ index ae72b7a..237315f 100644
 -    // Wait until another thread has finished updating the clock.
 -    lock.lock();
 -    return last_guest_tick_count_;
--  }
++  if (const GuestClockSegment* segment = guest_segment_.load(std::memory_order_acquire)) {
++    const uint64_t host_delta =
++        host_tick_count > segment->host_base ? host_tick_count - segment->host_base : 0;
++    return segment->guest_base + uint64_t(double(host_delta) * segment->ratio);
+   }
 +  // guest_tick_ratio_ is (re)computed at startup / on a scalar change; a racy copy
 +  // here is benign (worst case: one tick read straddles a rare ratio change). The
 +  // ratio is reduced (small numerator), so host_tick_count * first does not
@@ -1088,6 +1131,42 @@ index ae72b7a..237315f 100644
  }
  
  // Offset of the current guest system file time relative to the guest base time.
+@@ -147,6 +168,35 @@ void Clock::set_guest_tick_frequency(uint64_t frequency) {
+   RecomputeGuestTickScalar();
+ }
+ 
++double Clock::guest_rate() {
++  std::lock_guard<std::mutex> lock(tick_mutex_);
++  return guest_rate_;
++}
++
++void Clock::set_guest_rate(double rate) {
++  if (!(rate > 0.5 && rate < 2.0)) {
++    return;
++  }
++  std::lock_guard<std::mutex> lock(tick_mutex_);
++  if (rate == guest_rate_) {
++    return;
++  }
++  // Continue from the guest tick count at this instant.
++  const uint64_t host_now = Clock::QueryHostTickCount();
++  uint64_t guest_now;
++  if (const GuestClockSegment* segment = guest_segment_.load(std::memory_order_acquire)) {
++    const uint64_t host_delta = host_now > segment->host_base ? host_now - segment->host_base : 0;
++    guest_now = segment->guest_base + uint64_t(double(host_delta) * segment->ratio);
++  } else {
++    guest_now = host_now * guest_tick_ratio_.first / guest_tick_ratio_.second;
++  }
++  const double base_ratio =
++      double(guest_tick_ratio_.first) / double(guest_tick_ratio_.second);
++  guest_segment_.store(new GuestClockSegment{host_now, guest_now, base_ratio * rate},
++                       std::memory_order_release);
++  guest_rate_ = rate;
++}
++
+ uint64_t Clock::guest_system_time_base() {
+   return guest_system_time_base_;
+ }
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
 index 228728d..912a144 100644
 --- a/src/core/cvar.cpp
@@ -2256,7 +2335,7 @@ index 2be0e8e..72ae14c 100644
    ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
  
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..37c6384 100644
+index 8f2fcb0..2bf39c1 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -12,14 +12,17 @@
@@ -2332,7 +2411,7 @@ index 8f2fcb0..37c6384 100644
  namespace {
  
  rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
-@@ -156,18 +198,182 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -156,18 +198,189 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
          uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
          uint64_t vsync_interval_ticks =
              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
@@ -2376,8 +2455,14 @@ index 8f2fcb0..37c6384 100644
 +            const double hz = wanted_rate_hz >= 30.0 && wanted_rate_hz <= 240.0
 +                                  ? wanted_rate_hz
 +                                  : refresh_rate_hz;
++            // ge: run the whole guest clock at the new rate, not just the
++            // vblank: the game counts its simulation steps from the timebase,
++            // so a vblank slower than the timebase's 60 Hz made one frame in
++            // every few hundred advance two steps (a visible jump). The
++            // vblank stays at the video mode's rate in guest time.
++            chrono::Clock::set_guest_rate(hz / refresh_rate_hz);
 +            vsync_interval_ticks =
-+                std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / hz));
++                std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
 +          }
 +          // ge: one interval stretched or shortened by the display phase lock.
 +          const uint64_t interval_ticks =
@@ -2448,7 +2533,8 @@ index 8f2fcb0..37c6384 100644
 +                  const int64_t max_step = qpc_freq.QuadPart / 10000;
 +                  const int64_t step = std::clamp<int64_t>(-error / 4, -max_step, max_step);
 +                  const int64_t step_ticks =
-+                      step * int64_t(guest_tick_frequency) / int64_t(qpc_freq.QuadPart);
++                      int64_t(double(step) * double(guest_tick_frequency) *
++                                  chrono::Clock::guest_rate() / double(qpc_freq.QuadPart));
 +                  phase_step_ticks = step_ticks;  // applied to the next interval only
 +                  if (REXCVAR_GET(vblank_timing_log)) {
 +                    static int phase_log = 0;
@@ -2520,7 +2606,7 @@ index 8f2fcb0..37c6384 100644
          return 0;
        }));
    // TODO: set_can_debugger_suspend not yet ported
-@@ -312,8 +518,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+@@ -312,8 +525,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
    //          interrupt_callback_, source, cpu);
  
    uint64_t args[] = {source, interrupt_callback_data_};
@@ -7651,10 +7737,41 @@ index 697399c..a4fe5a3 100644
    TerminateNotification notify;
    notify.guest_routine = routine;
 diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
-index c10694c..d85444a 100644
+index c10694c..9abb21d 100644
 --- a/src/system/runtime.cpp
 +++ b/src/system/runtime.cpp
-@@ -236,9 +236,12 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <rex/chrono/clock.h>
++#include <algorithm>
++
+ #include <rex/cvar.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+@@ -33,6 +35,11 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
+ REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
++// ge: the guest timebase rate (mftb, KeQueryPerformanceFrequency). The Xbox 360
++// timebase runs at 49.875 MHz; games that count time in timebase ticks with
++// that rate built in run 0.25% fast against the vblank at 50 MHz.
++REXCVAR_DEFINE_INT32(guest_timebase_hz, 50000000, "Clock",
++                     "Guest timebase frequency in Hz (Xbox 360 hardware: 49875000)");
+ 
+ namespace rex {
+ 
+@@ -105,7 +112,8 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+   rex::initialize_seh();
+ 
+   // Initialize clock
+-  chrono::Clock::set_guest_tick_frequency(50000000);
++  chrono::Clock::set_guest_tick_frequency(
++      uint64_t(std::clamp(REXCVAR_GET(guest_timebase_hz), 1000000, 200000000)));
+   chrono::Clock::set_guest_system_time_base(chrono::Clock::QueryHostSystemTime());
+   chrono::Clock::set_guest_time_scalar(1.0);
+ 
+@@ -236,9 +244,12 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
      REXSYS_DEBUG("Registered {} recompiled functions ({} duplicates, {} rejected)", count,
                   duplicates, rejected);
      if (rejected > 0) {
@@ -7905,10 +8022,10 @@ index 2d13ac8..987ec24 100644
  
  bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 306118e..ce1718f 100644
+index 306118e..6db52d1 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
 +++ b/src/ui/d3d12/d3d12_presenter.cpp
-@@ -1155,9 +1155,94 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -1155,9 +1155,151 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
    // fullscreen is ever used in, the allow tearing flag must not be passed in
    // fullscreen, but DXGI fullscreen is largely unneeded with the flip
    // presentation model used in Direct3D 12).
@@ -7945,9 +8062,55 @@ index 306118e..ce1718f 100644
 +        static uint64_t refreshes = 0, shown = 0, repeats = 0, drops = 0, events = 0;
 +        static LARGE_INTEGER window_start{};
 +        static std::string event_times;
++        // Also how long each frame took from Present to the screen (the
++        // display's own timestamp of the refresh that showed it), and how far
++        // apart consecutive frames reached the screen. A GPU that stalls (for
++        // example while the driver switches its memory clock) shows as a late
++        // frame here even on a G-Sync / FreeSync screen, where no refresh is
++        // repeated and the counts above stay clean.
++        static int64_t present_qpc[64] = {};
++        static LARGE_INTEGER last_sync_qpc{};
++        static uint64_t latency_n = 0, late = 0, gaps = 0;
++        static double latency_sum = 0.0, latency_max = 0.0, gap_max = 0.0;
++        static double latency_usual = 0.0;  // slow running average, kept across windows
++        static std::string late_times;
++        {
++          UINT last_id = 0;
++          if (SUCCEEDED(paint_context_.swap_chain->GetLastPresentCount(&last_id))) {
++            present_qpc[last_id & 63] = now.QuadPart;
++          }
++        }
 +        DXGI_FRAME_STATISTICS fs;
 +        if (SUCCEEDED(paint_context_.swap_chain->GetFrameStatistics(&fs)) && fs.PresentCount) {
 +          if (!window_start.QuadPart) window_start = now;
++          if (fs.PresentCount != last_present_count && fs.SyncQPCTime.QuadPart) {
++            const int64_t called = present_qpc[fs.PresentCount & 63];
++            const double to_ms = 1000.0 / double(freq.QuadPart);
++            if (called && fs.SyncQPCTime.QuadPart >= called) {
++              const double latency = double(fs.SyncQPCTime.QuadPart - called) * to_ms;
++              if (latency < 500.0) {
++                const bool is_late = latency_usual > 0.0 && latency > latency_usual + 6.0;
++                latency_usual = latency_usual > 0.0 ? latency_usual + (latency - latency_usual) * 0.02
++                                                    : latency;
++                ++latency_n;
++                latency_sum += latency;
++                latency_max = std::max(latency_max, latency);
++                if (is_late && ++late <= 6) {
++                  late_times += fmt::format(
++                      " {:.2f}s ({:.1f} ms)",
++                      double(now.QuadPart - window_start.QuadPart) / double(freq.QuadPart),
++                      latency);
++                }
++              }
++            }
++            if (last_sync_qpc.QuadPart && fs.PresentCount == last_present_count + 1) {
++              const double gap =
++                  double(fs.SyncQPCTime.QuadPart - last_sync_qpc.QuadPart) * to_ms;
++              gap_max = std::max(gap_max, gap);
++              if (gap > 16.67 * 1.5) ++gaps;
++            }
++            last_sync_qpc = fs.SyncQPCTime;
++          }
 +          if (last_present_count && fs.PresentCount != last_present_count) {
 +            const int64_t dp = int64_t(fs.PresentCount) - int64_t(last_present_count);
 +            const int64_t dr = int64_t(fs.PresentRefreshCount) - int64_t(last_refresh_count);
@@ -7972,9 +8135,20 @@ index 306118e..ce1718f 100644
 +            REXLOG_INFO("ge display: {} frames shown over {} refreshes, {} repeated, {} dropped{}{}",
 +                        shown, refreshes, repeats, drops, events ? "; at" : "",
 +                        events > 6 ? event_times + " ..." : event_times);
++            if (latency_n) {
++              REXLOG_INFO("ge display: present to screen {:.1f} ms mean, {:.1f} max; {} late frames "
++                          "(over 6 ms later than usual){}{}; longest gap between frames on "
++                          "screen {:.1f} ms ({} over 25 ms)",
++                          latency_sum / double(latency_n), latency_max, late,
++                          late ? " at" : "", late > 6 ? late_times + " ..." : late_times, gap_max,
++                          gaps);
++            }
 +            window_start = now;
 +            refreshes = shown = repeats = drops = events = 0;
 +            event_times.clear();
++            latency_n = late = gaps = 0;
++            latency_sum = latency_max = gap_max = 0.0;
++            late_times.clear();
 +          }
 +        }
 +      }
@@ -8030,6 +8204,19 @@ index f270f3c..319674e 100644
        presenter_->RequestUIPaintFromUIThread();
      }
    }
+diff --git a/src/ui/keybinds.cpp b/src/ui/keybinds.cpp
+index 9822f3b..33495f9 100644
+--- a/src/ui/keybinds.cpp
++++ b/src/ui/keybinds.cpp
+@@ -141,6 +141,8 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
+     {"LMB", VirtualKey::kLButton},
+     {"RMB", VirtualKey::kRButton},
+     {"MMB", VirtualKey::kMButton},
++    {"Mouse4", VirtualKey::kXButton1},  // ge: side buttons (back / forward)
++    {"Mouse5", VirtualKey::kXButton2},
+ };
+ 
+ VirtualKey ParseVirtualKey(std::string_view name) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 7360ed9..009b51c 100644
 --- a/src/ui/presenter.cpp
