@@ -106,8 +106,10 @@ END
         Pop-Location
     }
 
-    # main_cli.cpp is the Linux entry point (packaging/launcher/CMakeLists.txt); sha256.h is header-only.
-    $sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter *.cpp | Where-Object Name -ne 'main_cli.cpp' | ForEach-Object FullName)
+    # main_cli.cpp and setup_window_sdl.cpp are the Linux launcher (packaging/launcher/CMakeLists.txt);
+    # sha256.h is header-only.
+    $sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter *.cpp |
+        Where-Object { $_.Name -notin @('main_cli.cpp', 'setup_window_sdl.cpp') } | ForEach-Object FullName)
     & $clang /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DNOMINMAX "/DGE_VERSION=$Version" `
         "/I$sourceDir" "/Fo$work\" @sources "/Fe$output" /link /SUBSYSTEM:WINDOWS `
         user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib $resPath
