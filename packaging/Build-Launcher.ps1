@@ -106,10 +106,11 @@ END
         Pop-Location
     }
 
-    $sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter *.cpp | ForEach-Object FullName)
+    # main_cli.cpp is the Linux entry point (packaging/launcher/CMakeLists.txt); sha256.h is header-only.
+    $sources = @(Get-ChildItem -LiteralPath $sourceDir -Filter *.cpp | Where-Object Name -ne 'main_cli.cpp' | ForEach-Object FullName)
     & $clang /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DNOMINMAX "/DGE_VERSION=$Version" `
         "/I$sourceDir" "/Fo$work\" @sources "/Fe$output" /link /SUBSYSTEM:WINDOWS `
-        user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib bcrypt.lib $resPath
+        user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib $resPath
     if ($LASTEXITCODE -ne 0) { throw 'clang-cl failed for the launcher' }
     Write-Host ('Built {0} ({1:N0} bytes)' -f (Split-Path -Leaf $output), (Get-Item -LiteralPath $output).Length)
 }
